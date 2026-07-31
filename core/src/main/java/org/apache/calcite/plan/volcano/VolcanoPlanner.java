@@ -961,6 +961,14 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     checkCancel();
     queue.offer(rel, metadataChanged);
 
+    // Unlike the previous implementation, which only ever propagated cost
+    // reductions, this loop has no monotonically decreasing quantity to bound
+    // it. It nevertheless terminates: a rel is re-queued only when its cost
+    // actually changes, and the cost of a rel changes only when the winner of
+    // one of its descendant subsets changes. Because a winner is chosen from a
+    // fixed set of candidates, and is only replaced by a strictly cheaper
+    // acyclic candidate or recomputed from scratch when its own cost rises,
+    // the winners reach a fixed point.
     RelNode relNode;
     while ((relNode = queue.poll()) != null) {
       checkCancel();
@@ -971,16 +979,18 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
         }
         BestChange bestChange =
             updateBest(subset, relNode, mq, relMetadataChanged);
-        boolean metadataCacheCleared =
-            relMetadataChanged && relNode == subset.best
-                && mq.clearCache(subset);
         if (bestChange.costIncreased) {
           costIncreasedSets.add(subset.set);
         }
-        if (bestChange == BestChange.NONE && !metadataCacheCleared) {
+        boolean changed = bestChange != BestChange.NONE;
+        // Note that this is evaluated after updateBest, which may have made
+        // some other rel the winner of this subset.
+        boolean metadataCacheCleared = !changed && relMetadataChanged
+            && relNode == subset.best && mq.clearCache(subset);
+        if (!changed && !metadataCacheCleared) {
           continue;
         }
-        if (bestChange != BestChange.NONE) {
+        if (changed) {
           mq.clearCache(subset);
         } else {
           subset.timestamp++;
@@ -996,13 +1006,33 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     }
   }
 
+  /**
+   * Re-evaluates the best expression of a subset in the light of a change to
+   * {@code rel}.
+   *
+   * <p>A rel only becomes the winner if the plan rooted at it is acyclic, so
+   * the graph of winners is acyclic by induction. Merging sets is the only
+   * operation that can make an already installed winner cyclic, because it
+   * rewrites the inputs of expressions that are not themselves being
+   * re-evaluated; callers on that path pass
+   * {@code recheckBestForCycles = true}.
+   *
+   * @param subset               Subset to re-evaluate
+   * @param rel                  Expression whose cost has changed
+   * @param mq                   Metadata query
+   * @param recheckBestForCycles Whether the current winner may have become
+   *                             cyclic since it was chosen
+   */
   private BestChange updateBest(RelSubset subset, RelNode rel,
-      RelMetadataQuery mq, boolean bestMayBeCyclic) {
+      RelMetadataQuery mq, boolean recheckBestForCycles) {
     RelOptCost cost = getCostSafely(rel, mq);
     if (subset.best != null && !subset.contains(subset.best)) {
       return recomputeBest(subset, mq, null, false);
     }
     if (rel != subset.best) {
+      // If the subset has no winner its best cost is infinite, and so is the
+      // cost of any plan that reaches it; such a plan therefore cannot pass
+      // the test above, and there is no need to look for a cycle.
       if (cost == null || !cost.isLt(subset.bestCost)
           || subset.best != null && isPlanCyclic(subset, rel)) {
         return BestChange.NONE;
@@ -1011,11 +1041,18 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     }
 
     boolean cyclic =
-        bestMayBeCyclic && isPlanCyclic(subset, rel);
-    if (!cyclic && cost != null && cost.equals(subset.bestCost)) {
+        recheckBestForCycles && isPlanCyclic(subset, rel);
+    if (cost == null) {
+      // The cost of the winner is temporarily unknowable, because computing it
+      // requires metadata that is currently being computed. Leave the winner in
+      // place; a later propagation re-evaluates it once its cost can be
+      // computed. Only a winner that has become cyclic must be replaced.
+      return cyclic ? recomputeBest(subset, mq, null, true) : BestChange.NONE;
+    }
+    if (!cyclic && cost.equals(subset.bestCost)) {
       return BestChange.NONE;
     }
-    if (!cyclic && cost != null && cost.isLt(subset.bestCost)) {
+    if (!cyclic && cost.isLt(subset.bestCost)) {
       return setBest(subset, rel, cost);
     }
     return recomputeBest(subset, mq, cost, cyclic);

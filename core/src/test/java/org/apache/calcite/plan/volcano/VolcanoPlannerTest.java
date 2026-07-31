@@ -40,6 +40,7 @@ import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.core.RelFactories;
 import org.apache.calcite.rel.externalize.RelDotWriter;
 import org.apache.calcite.rel.logical.LogicalProject;
+import org.apache.calcite.rel.metadata.CyclicMetadataException;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.rules.CoreRules;
 import org.apache.calcite.sql.SqlExplainLevel;
@@ -200,6 +201,34 @@ class VolcanoPlannerTest {
 
     assertThat(subset.getBest(), sameInstance(alternative));
     assertThat(subset.bestCost.getRows(), is(5D));
+  }
+
+  @Test void testKeepsBestRelWhenCostIsNotComputable() {
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+    RelOptCluster cluster = newCluster(planner);
+
+    CostLeafRel input = new CostLeafRel(cluster, "input", 1D);
+    planner.ensureRegistered(input, null);
+    RelSubset subset =
+        planner.ensureRegistered(
+            new CyclicCostSingleRel(cluster, input, "best"), null);
+    RelNode best = subset.getBest();
+    assertThat(best, instanceOf(CyclicCostSingleRel.class));
+    assertThat(subset.bestCost.getRows(), is(2D));
+    CostLeafRel alternative = new CostLeafRel(cluster, "alternative", 5D);
+    planner.ensureRegistered(alternative, best);
+
+    // The cost of the winner is no longer computable. That is not the same as
+    // the winner becoming more expensive, so the subset must keep it rather
+    // than fall back on the more expensive alternative.
+    ((CyclicCostSingleRel) best).cyclic = true;
+    input.cost = 3D;
+    cluster.getMetadataQuery().clearCache(input);
+    planner.propagateCostImprovements(input);
+
+    assertThat(subset.getBest(), sameInstance(best));
+    assertThat(subset.bestCost.getRows(), is(2D));
   }
 
   /** Test case for
@@ -1235,6 +1264,35 @@ class VolcanoPlannerTest {
     @Override public RelOptCost computeSelfCost(RelOptPlanner planner,
         RelMetadataQuery mq) {
       return planner.getCostFactory().makeCost(cost, cost, 0D);
+    }
+
+    @Override public RelWriter explainTerms(RelWriter pw) {
+      return super.explainTerms(pw).item("label", label);
+    }
+  }
+
+  /** Single-input relational expression whose cost cannot be computed once
+   * {@code cyclic} is set. */
+  private static class CyclicCostSingleRel extends TestSingleRel {
+    private final String label;
+    private boolean cyclic;
+
+    CyclicCostSingleRel(RelOptCluster cluster, RelNode input, String label) {
+      super(cluster, cluster.traitSetOf(PHYS_CALLING_CONVENTION), input);
+      this.label = label;
+    }
+
+    @Override public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
+      assert traitSet.comprises(PHYS_CALLING_CONVENTION);
+      return new CyclicCostSingleRel(getCluster(), sole(inputs), label);
+    }
+
+    @Override public RelOptCost computeSelfCost(RelOptPlanner planner,
+        RelMetadataQuery mq) {
+      if (cyclic) {
+        throw new CyclicMetadataException();
+      }
+      return planner.getCostFactory().makeCost(1D, 1D, 0D);
     }
 
     @Override public RelWriter explainTerms(RelWriter pw) {
