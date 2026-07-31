@@ -72,6 +72,7 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -927,14 +928,6 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
         boolean existed = subset.set.rels.remove(rel);
         checkArgument(existed, "rel was not known to its set");
         final RelSubset equivSubset = getSubsetNonNull(equivRel);
-        for (RelSubset s : subset.set.subsets) {
-          if (s.best == rel) {
-            s.best = equivRel;
-            // Propagate cost improvement since this potentially would change the subset's best cost
-            propagateCostImprovements(equivRel);
-          }
-        }
-
         if (equivSubset != subset) {
           // The equivalent relational expression is in a different
           // subset, therefore the sets are equivalent.
@@ -943,88 +936,289 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
           assert equivSubset.set != subset.set;
           merge(equivSubset.set, subset.set);
         }
+        // Re-evaluate the canonical set after the merge. In particular, the
+        // removed expression may have been the winner of its old subset.
+        propagateCostImprovements(equivRel, true);
       }
     }
   }
 
   /**
-   * Checks whether a relexp has made any subset cheaper, and if it so,
-   * propagate new cost to parent rel nodes.
+   * Checks whether a relexp has changed the best expression of any subset,
+   * and propagates changes to parent rel nodes.
    *
-   * @param rel       Relational expression whose cost has improved
+   * @param rel Relational expression whose cost has changed
    */
   void propagateCostImprovements(RelNode rel) {
+    propagateCostImprovements(rel, false);
+  }
+
+  void propagateCostImprovements(RelNode rel,
+      boolean metadataChanged) {
     RelMetadataQuery mq = rel.getCluster().getMetadataQuery();
-    Map<RelNode, RelOptCost> propagateRels = new HashMap<>();
-    PriorityQueue<RelNode> propagateHeap = new PriorityQueue<>((o1, o2) -> {
-      RelOptCost c1 = propagateRels.get(o1);
-      RelOptCost c2 = propagateRels.get(o2);
-      if (c1 == null) {
-        return c2 == null ? 0 : -1;
-      }
-      if (c2 == null) {
-        return 1;
-      }
-      if (c1.equals(c2)) {
-        return 0;
-      } else if (c1.isLt(c2)) {
-        return -1;
-      }
-      return 1;
-    });
-    propagateRels.put(rel, getCostOrInfinite(rel, mq));
-    propagateHeap.offer(rel);
+    CostPropagationQueue queue = new CostPropagationQueue(mq);
+    Set<RelSet> costIncreasedSets = new HashSet<>();
+    checkCancel();
+    queue.offer(rel, metadataChanged);
 
     RelNode relNode;
-    while ((relNode = propagateHeap.poll()) != null) {
-      RelOptCost cost = requireNonNull(propagateRels.get(relNode), "propagateRels.get(relNode)");
-
+    while ((relNode = queue.poll()) != null) {
+      checkCancel();
+      boolean relMetadataChanged = queue.metadataChanged(relNode);
       for (RelSubset subset : getSubsetNonNull(relNode).set.subsets) {
         if (!relNode.getTraitSet().satisfies(subset.getTraitSet())) {
           continue;
         }
-
-        // Update subset best and best's cost when we find a cheaper rel
-        if (relNode != subset.best && !cost.isLt(subset.bestCost)) {
+        BestChange bestChange =
+            updateBest(subset, relNode, mq, relMetadataChanged);
+        boolean metadataCacheCleared =
+            relMetadataChanged && relNode == subset.best
+                && mq.clearCache(subset);
+        if (bestChange.costIncreased) {
+          costIncreasedSets.add(subset.set);
+        }
+        if (bestChange == BestChange.NONE && !metadataCacheCleared) {
           continue;
         }
-
-        // The cost of the RelNode is updated when a change is detected.
-
-        // The reason for this update is that when one of the subsets in RelSet finds a RelNode
-        // with a lower cost, it is necessary to update the parents of the subset to
-        // have the best RelNode and best cost.
-        // In theory, this cost should become smaller.
-        // However, according to the SQL added in the JdbcAdapterTest {@link testVolcanoPlannerInternalValid},
-        // it is observed that the cost of RelNode can sometimes increase.
-        // Therefore, an update is performed.
-        if (relNode == subset.best && cost.equals(subset.bestCost)) {
-          continue;
+        if (bestChange != BestChange.NONE) {
+          mq.clearCache(subset);
+        } else {
+          subset.timestamp++;
         }
-
-        subset.timestamp++;
-        LOGGER.trace("Subset cost changed: subset [{}] cost was {} now {}",
-            subset, subset.bestCost, cost);
-
-        subset.bestCost = cost;
-        subset.best = relNode;
-        // since best was changed, cached metadata for this subset should be removed
-        mq.clearCache(subset);
-
         for (RelNode parent : subset.getParents()) {
-          mq.clearCache(parent);
-          RelOptCost newCost = getCostOrInfinite(parent, mq);
-          RelOptCost existingCost = propagateRels.get(parent);
-          if (existingCost == null || newCost.isLt(existingCost)) {
-            propagateRels.put(parent, newCost);
-            if (existingCost != null) {
-              // Cost reduced, force the heap to adjust its ordering
-              propagateHeap.remove(parent);
-            }
-            propagateHeap.offer(parent);
+          queue.offer(parent,
+              bestChange.bestChanged || metadataCacheCleared);
+        }
+      }
+    }
+    if (!costIncreasedSets.isEmpty()) {
+      ruleDriver.onCostIncrease(costIncreasedSets);
+    }
+  }
+
+  private BestChange updateBest(RelSubset subset, RelNode rel,
+      RelMetadataQuery mq, boolean bestMayBeCyclic) {
+    RelOptCost cost = getCostSafely(rel, mq);
+    if (subset.best != null && !subset.contains(subset.best)) {
+      return recomputeBest(subset, mq, null, false);
+    }
+    if (rel != subset.best) {
+      if (cost == null || !cost.isLt(subset.bestCost)
+          || subset.best != null && isPlanCyclic(subset, rel)) {
+        return BestChange.NONE;
+      }
+      return setBest(subset, rel, cost);
+    }
+
+    boolean cyclic =
+        bestMayBeCyclic && isPlanCyclic(subset, rel);
+    if (!cyclic && cost != null && cost.equals(subset.bestCost)) {
+      return BestChange.NONE;
+    }
+    if (!cyclic && cost != null && cost.isLt(subset.bestCost)) {
+      return setBest(subset, rel, cost);
+    }
+    return recomputeBest(subset, mq, cost, cyclic);
+  }
+
+  private BestChange recomputeBest(RelSubset subset, RelMetadataQuery mq,
+      @Nullable RelOptCost previousBestCost, boolean previousBestCyclic) {
+    RelNode best = null;
+    RelOptCost bestCost = infCost;
+    RelNode previousBest = subset.best;
+    PlanCycleChecker cycleChecker = new PlanCycleChecker(subset);
+
+    if (previousBest != null && subset.contains(previousBest)
+        && previousBestCost != null && previousBestCost.isLt(bestCost)
+        && !previousBestCyclic) {
+      best = previousBest;
+      bestCost = previousBestCost;
+    }
+
+    for (RelNode rel : subset.getRels()) {
+      checkCancel();
+      if (rel == previousBest) {
+        continue;
+      }
+      RelOptCost cost = getCostSafely(rel, mq);
+      if (cost != null && cost.isLt(bestCost)
+          && !cycleChecker.isCyclic(rel)) {
+        best = rel;
+        bestCost = cost;
+      }
+    }
+
+    return setBest(subset, best, bestCost);
+  }
+
+  private BestChange setBest(RelSubset subset, @Nullable RelNode best,
+      RelOptCost bestCost) {
+    if (best == subset.best && bestCost.equals(subset.bestCost)) {
+      return BestChange.NONE;
+    }
+
+    boolean bestChanged = best != subset.best;
+    boolean costIncreased = subset.bestCost.isLt(bestCost);
+    subset.timestamp++;
+    LOGGER.trace("Subset cost changed: subset [{}] cost was {} now {}",
+        subset, subset.bestCost, bestCost);
+    subset.best = best;
+    subset.bestCost = bestCost;
+    return BestChange.of(bestChanged, costIncreased);
+  }
+
+  private @Nullable RelOptCost getCostSafely(RelNode rel, RelMetadataQuery mq) {
+    try {
+      return getCostOrInfinite(rel, mq);
+    } catch (CyclicMetadataException e) {
+      return null;
+    }
+  }
+
+  private boolean isPlanCyclic(RelSubset subset, RelNode rel) {
+    return new PlanCycleChecker(subset).isCyclic(rel);
+  }
+
+  /** Detects cycles while reusing results for plans with shared descendants. */
+  private class PlanCycleChecker {
+    private final RelSubset subset;
+    private final Set<RelNode> acyclic =
+        Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Set<RelNode> cyclic =
+        Collections.newSetFromMap(new IdentityHashMap<>());
+
+    PlanCycleChecker(RelSubset subset) {
+      this.subset = subset;
+    }
+
+    boolean isCyclic(RelNode rel) {
+      Set<RelNode> active =
+          Collections.newSetFromMap(new IdentityHashMap<>());
+      Deque<Pair<RelNode, Boolean>> stack = new ArrayDeque<>();
+      stack.push(Pair.of(rel, false));
+      while (!stack.isEmpty()) {
+        checkCancel();
+        Pair<RelNode, Boolean> visit = stack.pop();
+        RelNode node = visit.left;
+        if (visit.right) {
+          active.remove(node);
+          acyclic.add(node);
+          continue;
+        }
+        if (node == subset || cyclic.contains(node)
+            || !active.add(node)) {
+          cyclic.add(node);
+          cyclic.addAll(active);
+          LOGGER.trace("Skipping cyclic best expression [{}] for subset [{}]",
+              rel, subset);
+          return true;
+        }
+        if (acyclic.contains(node)) {
+          active.remove(node);
+          continue;
+        }
+
+        stack.push(Pair.of(node, true));
+        if (node instanceof RelSubset) {
+          RelNode best = ((RelSubset) node).best;
+          if (best != null) {
+            stack.push(Pair.of(best, false));
+          }
+        } else {
+          List<RelNode> inputs = node.getInputs();
+          for (int i = inputs.size() - 1; i >= 0; i--) {
+            stack.push(Pair.of(inputs.get(i), false));
           }
         }
       }
+      return false;
+    }
+  }
+
+  /** Type of change made to a subset's best expression. */
+  private enum BestChange {
+    NONE(false, false),
+    COST(false, false),
+    COST_INCREASE(false, true),
+    BEST(true, false),
+    BEST_COST_INCREASE(true, true);
+
+    final boolean bestChanged;
+    final boolean costIncreased;
+
+    BestChange(boolean bestChanged, boolean costIncreased) {
+      this.bestChanged = bestChanged;
+      this.costIncreased = costIncreased;
+    }
+
+    static BestChange of(boolean bestChanged, boolean costIncreased) {
+      if (bestChanged) {
+        return costIncreased ? BEST_COST_INCREASE : BEST;
+      }
+      return costIncreased ? COST_INCREASE : COST;
+    }
+  }
+
+  /** Work queue for propagating cost and metadata changes. */
+  private class CostPropagationQueue {
+    private final Map<RelNode, RelOptCost> costs = new IdentityHashMap<>();
+    private final Set<RelNode> metadataChanged =
+        Collections.newSetFromMap(new IdentityHashMap<>());
+    private final RelMetadataQuery mq;
+    private final PriorityQueue<RelNode> queue =
+        new PriorityQueue<>((rel1, rel2) -> {
+          RelOptCost cost1 = requireNonNull(costs.get(rel1));
+          RelOptCost cost2 = requireNonNull(costs.get(rel2));
+          if (cost1.equals(cost2)) {
+            return 0;
+          }
+          return cost1.isLt(cost2) ? -1 : 1;
+        });
+    private final Set<RelNode> queued =
+        Collections.newSetFromMap(new IdentityHashMap<>());
+
+    CostPropagationQueue(RelMetadataQuery mq) {
+      this.mq = mq;
+    }
+
+    void offer(RelNode rel, boolean metadataMayHaveChanged) {
+      mq.clearCache(rel);
+      RelOptCost cost = getCostSafely(rel, mq);
+      if (cost == null) {
+        cost = infCost;
+      }
+      RelOptCost previousCost = costs.get(rel);
+      boolean costChanged =
+          previousCost == null || !cost.equals(previousCost);
+      if (metadataMayHaveChanged) {
+        metadataChanged.add(rel);
+      }
+
+      if (queued.contains(rel)) {
+        if (costChanged) {
+          queue.remove(rel);
+          costs.put(rel, cost);
+          queue.offer(rel);
+        }
+        return;
+      }
+      costs.put(rel, cost);
+      if (costChanged || metadataMayHaveChanged) {
+        queued.add(rel);
+        queue.offer(rel);
+      }
+    }
+
+    @Nullable RelNode poll() {
+      RelNode rel = queue.poll();
+      if (rel != null) {
+        queued.remove(rel);
+      }
+      return rel;
+    }
+
+    boolean metadataChanged(RelNode rel) {
+      return metadataChanged.remove(rel);
     }
   }
 
@@ -1423,7 +1617,7 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
     // not established. So, give the subset another chance to figure out
     // its cost.
     try {
-      propagateCostImprovements(rel);
+      propagateCostImprovements(rel, false);
     } catch (CyclicMetadataException e) {
       // ignore
     }

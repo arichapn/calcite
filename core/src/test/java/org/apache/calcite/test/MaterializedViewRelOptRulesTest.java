@@ -543,7 +543,8 @@ class MaterializedViewRelOptRulesTest {
             "EnumerableUnion(all=[true])",
             "EnumerableAggregate(group=[{2}])",
             "EnumerableTableScan(table=[[hr, MV0]])",
-            "expr#6=[Sarg[(10..11], [19..20)]], expr#7=[SEARCH($t5, $t6)]")
+            "expr#6=[Sarg[(-\u221e..11], [19..+\u221e)]], expr#7=[SEARCH($t5, $t6)]",
+            "expr#6=[Sarg[(10..20)]], expr#7=[SEARCH($t5, $t6)]")
         .ok();
   }
 
@@ -802,7 +803,8 @@ class MaterializedViewRelOptRulesTest {
             "EnumerableAggregate(group=[{2}], agg#0=[COUNT()])",
             "EnumerableAggregate(group=[{1}], agg#0=[$SUM0($2)])",
             "EnumerableTableScan(table=[[hr, MV0]])",
-            "expr#6=[Sarg[(10..11], [19..20)]], expr#7=[SEARCH($t5, $t6)]")
+            "expr#6=[Sarg[(-\u221e..11], [19..+\u221e)]], expr#7=[SEARCH($t5, $t6)]",
+            "expr#6=[Sarg[(10..20)]], expr#7=[SEARCH($t5, $t6)]")
         .ok();
   }
 

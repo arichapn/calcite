@@ -18,6 +18,8 @@ package org.apache.calcite.plan.volcano;
 
 import org.apache.calcite.rel.RelNode;
 
+import java.util.Collection;
+
 /**
  * A rule driver applies rules with designed algorithms.
  */
@@ -40,6 +42,13 @@ interface RuleDriver {
    * @param subset subset to add
    */
   void onProduce(RelNode rel, RelSubset subset);
+
+  /**
+   * Callback when the best cost of subsets in {@link RelSet}s increases.
+   *
+   * @param sets Sets whose best cost increased
+   */
+  void onCostIncrease(Collection<RelSet> sets);
 
   /**
    * Callback when RelSets are merged.

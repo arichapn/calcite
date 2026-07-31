@@ -423,7 +423,7 @@ class RelSet {
 
     // propagate the new best information from changed relNodes.
     for (RelNode rel : changedRels) {
-      planner.propagateCostImprovements(rel);
+      planner.propagateCostImprovements(rel, true);
     }
 
     // Update all rels which have a child in the other set, to reflect the
@@ -445,7 +445,7 @@ class RelSet {
 
     // Make sure the cost changes as a result of merging are propagated.
     for (RelNode parentRel : getParentRels()) {
-      planner.propagateCostImprovements(parentRel);
+      planner.propagateCostImprovements(parentRel, true);
     }
     assert equivalentSet == null;
 

@@ -21,6 +21,8 @@ import org.apache.calcite.util.trace.CalciteTrace;
 
 import org.slf4j.Logger;
 
+import java.util.Collection;
+
 import static java.util.Objects.requireNonNull;
 
 /***
@@ -73,6 +75,9 @@ class IterativeRuleDriver implements RuleDriver {
   }
 
   @Override public void onProduce(RelNode rel, RelSubset subset) {
+  }
+
+  @Override public void onCostIncrease(Collection<RelSet> sets) {
   }
 
   @Override public void onSetMerged(RelSet set) {

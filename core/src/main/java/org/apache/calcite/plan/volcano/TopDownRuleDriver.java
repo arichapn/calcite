@@ -161,20 +161,44 @@ class TopDownRuleDriver implements RuleDriver {
     applyGenerator(null, () -> clearProcessed(set));
   }
 
-  private void clearProcessed(RelSet set) {
-    boolean explored = set.exploringState != null;
-    set.exploringState = null;
+  @Override public void onCostIncrease(Collection<RelSet> sets) {
+    // A higher winner cost invalidates upper-bound pruning decisions for this
+    // group and all groups that depend on it.
+    applyGenerator(null, () -> clearProcessed(sets));
+  }
 
-    for (RelSubset subset : set.subsets) {
-      if (subset.resetTaskState() || explored) {
-        Collection<RelNode> parentRels = subset.getParentRels();
-        for (RelNode parentRel : parentRels) {
-          RelSet parentRelSet =
-              requireNonNull(planner.getSet(parentRel), () -> "no set found for " + parentRel);
-          clearProcessed(parentRelSet);
-        }
-        if (subset == planner.root) {
-          tasks.push(new OptimizeGroup(subset, planner.infCost));
+  private void clearProcessed(RelSet set) {
+    List<RelSet> sets = new ArrayList<>();
+    sets.add(set);
+    clearProcessed(sets);
+  }
+
+  private void clearProcessed(Collection<RelSet> sets) {
+    Set<RelSet> visited = new HashSet<>();
+    Deque<RelSet> pending = new ArrayDeque<>();
+    for (RelSet set : sets) {
+      pending.push(set);
+    }
+    while (!pending.isEmpty()) {
+      planner.checkCancel();
+      RelSet current = pending.pop();
+      if (!visited.add(current)) {
+        continue;
+      }
+      boolean explored = current.exploringState != null;
+      current.exploringState = null;
+
+      for (RelSubset subset : current.subsets) {
+        if (subset.resetTaskState() || explored) {
+          Collection<RelNode> parentRels = subset.getParentRels();
+          for (RelNode parentRel : parentRels) {
+            pending.push(
+                requireNonNull(planner.getSet(parentRel),
+                    () -> "no set found for " + parentRel));
+          }
+          if (subset == planner.root) {
+            tasks.push(new OptimizeGroup(subset, planner.infCost));
+          }
         }
       }
     }

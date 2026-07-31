@@ -22,7 +22,9 @@ import org.apache.calcite.adapter.enumerable.EnumerableUnion;
 import org.apache.calcite.plan.Convention;
 import org.apache.calcite.plan.ConventionTraitDef;
 import org.apache.calcite.plan.RelOptCluster;
+import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptListener;
+import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelOptUtil;
@@ -31,15 +33,18 @@ import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelCollationTraitDef;
 import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.convert.ConverterImpl;
 import org.apache.calcite.rel.convert.ConverterRule;
 import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.core.RelFactories;
 import org.apache.calcite.rel.externalize.RelDotWriter;
 import org.apache.calcite.rel.logical.LogicalProject;
+import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.rules.CoreRules;
 import org.apache.calcite.sql.SqlExplainLevel;
 import org.apache.calcite.tools.RelBuilder;
+import org.apache.calcite.util.Litmus;
 import org.apache.calcite.util.Pair;
 
 import org.immutables.value.Value;
@@ -77,6 +82,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.arrayWithSize;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -168,6 +174,320 @@ class VolcanoPlannerTest {
 
     // Expect inputs to remain identical
     assertThat(result.getInput(1), is(result.getInput(0)));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-2166">[CALCITE-2166]
+   * Cumulative cost of RelSubset.best RelNode may increase</a>. */
+  @Test void testReselectsBestRelWhenCostIncreases() {
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+    RelOptCluster cluster = newCluster(planner);
+
+    CostLeafRel input = new CostLeafRel(cluster, "input", 1D);
+    planner.ensureRegistered(input, null);
+    CostSingleRel initiallyBest = new CostSingleRel(cluster, input, "initial", 1D);
+    RelSubset subset = planner.ensureRegistered(initiallyBest, null);
+    CostLeafRel alternative = new CostLeafRel(cluster, "alternative", 5D);
+    planner.ensureRegistered(alternative, subset.getBest());
+
+    assertThat(subset.getBest(), instanceOf(CostSingleRel.class));
+    assertThat(subset.bestCost.getRows(), is(2D));
+
+    input.cost = 10D;
+    cluster.getMetadataQuery().clearCache(input);
+    planner.propagateCostImprovements(input);
+
+    assertThat(subset.getBest(), sameInstance(alternative));
+    assertThat(subset.bestCost.getRows(), is(5D));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-3479">[CALCITE-3479]
+   * Stack overflow error thrown when running join query</a>. */
+  @Test void testReselectsLowestCostAcyclicPlan() {
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+    RelOptCluster cluster = newCluster(planner);
+
+    CostLeafRel relA = new CostLeafRel(cluster, "a", 10D);
+    planner.setRoot(relA);
+    RelSubset subsetA = (RelSubset) planner.getRoot();
+    CostLeafRel relB = new CostLeafRel(cluster, "b", 20D);
+    RelSubset subsetB = planner.ensureRegistered(relB, null);
+    planner.ensureRegistered(
+        new CostSingleRel(cluster, relB, "a-via-b", 1D), relA);
+    planner.ensureRegistered(
+        new CostSingleRel(cluster, relA, "b-via-a", 1D), relB);
+
+    assertThat(subsetA.getBest(), sameInstance(relA));
+    assertThat(subsetB.getBest(), instanceOf(CostSingleRel.class));
+
+    relA.cost = 30D;
+    cluster.getMetadataQuery().clearCache(relA);
+    planner.propagateCostImprovements(relA);
+
+    RelNode best = subsetA.buildCheapestPlan(planner);
+    assertThat(best, instanceOf(CostSingleRel.class));
+    assertThat(((CostSingleRel) best).label, is("a-via-b"));
+    assertThat(best.getInput(0), sameInstance(relB));
+    assertThat(subsetA.bestCost.getRows(), is(21D));
+    assertThat(subsetB.getBest(), sameInstance(relB));
+    assertThat(subsetB.bestCost.getRows(), is(20D));
+    assertTrue(planner.isValid(Litmus.THROW));
+  }
+
+  @Test void testPropagatesMetadataThroughEqualCostParent() {
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+    RelOptCluster cluster = newCluster(planner);
+
+    CostLeafRel child = new CostLeafRel(cluster, "child", 1D, 1D);
+    CostSingleRel parent = new CostSingleRel(cluster, child, "parent", 1D);
+    RowCountCostSingleRel root =
+        new RowCountCostSingleRel(cluster, parent, "root");
+    planner.setRoot(root);
+    RelSubset rootSubset = (RelSubset) planner.getRoot();
+    CostLeafRel rootAlternative =
+        new CostLeafRel(cluster, "root-alternative", 50D);
+    planner.ensureRegistered(rootAlternative, root);
+    CostLeafRel childAlternative =
+        new CostLeafRel(cluster, "child-alternative", 1D, 100D);
+    planner.ensureRegistered(childAlternative, child);
+
+    assertThat(rootSubset.getBest(), instanceOf(RowCountCostSingleRel.class));
+    assertThat(((RowCountCostSingleRel) rootSubset.getBest()).label, is("root"));
+    assertThat(rootSubset.bestCost.getRows(), is(3D));
+
+    child.cost = 2D;
+    cluster.getMetadataQuery().clearCache(child);
+    planner.propagateCostImprovements(child);
+
+    assertThat(planner.getSubsetNonNull(child).getBest(),
+        sameInstance(childAlternative));
+    assertThat(rootSubset.getBest(), sameInstance(rootAlternative));
+    assertThat(rootSubset.bestCost.getRows(), is(50D));
+  }
+
+  @Test void testStopsMetadataPropagationAtNonBestRel() {
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+    RelOptCluster cluster = newCluster(planner);
+
+    CostLeafRel child = new CostLeafRel(cluster, "child", 1D);
+    CostSingleRel nonBestParent =
+        new CostSingleRel(cluster, child, "non-best-parent", 100D);
+    planner.ensureRegistered(child, null);
+    RelSubset parentSubset =
+        planner.ensureRegistered(nonBestParent, null);
+    CostSingleRel root =
+        new CostSingleRel(cluster, nonBestParent, "root", 1D);
+    planner.setRoot(root);
+    RelSubset rootSubset = (RelSubset) planner.getRoot();
+    CostLeafRel parentAlternative =
+        new CostLeafRel(cluster, "parent-alternative", 10D);
+    planner.ensureRegistered(parentAlternative, nonBestParent);
+    CostLeafRel childAlternative =
+        new CostLeafRel(cluster, "child-alternative", 1D);
+    planner.ensureRegistered(childAlternative, child);
+    long rootTimestamp = rootSubset.timestamp;
+
+    child.cost = 2D;
+    cluster.getMetadataQuery().clearCache(child);
+    planner.propagateCostImprovements(child);
+
+    assertThat(parentSubset.getBest(), sameInstance(parentAlternative));
+    assertThat(rootSubset.timestamp, is(rootTimestamp));
+  }
+
+  @Test void testCostIncreaseInvalidatesTopDownState() {
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.setTopDownOpt(true);
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+    RelOptCluster cluster = newCluster(planner);
+
+    CostLeafRel initiallyBest =
+        new CostLeafRel(cluster, "initial", 1D);
+    planner.setRoot(initiallyBest);
+    RelSubset subset = (RelSubset) planner.getRoot();
+    CostLeafRel alternative =
+        new CostLeafRel(cluster, "alternative", 5D);
+    planner.ensureRegistered(alternative, initiallyBest);
+    subset.startOptimize(planner.infCost);
+    subset.setOptimized();
+
+    assertNotNull(subset.getWinnerCost());
+
+    initiallyBest.cost = 10D;
+    cluster.getMetadataQuery().clearCache(initiallyBest);
+    planner.propagateCostImprovements(initiallyBest);
+
+    assertThat(subset.getBest(), sameInstance(alternative));
+    assertThat(subset.bestCost.getRows(), is(5D));
+    assertNull(subset.taskState);
+  }
+
+  @Test void testDeepCostIncreaseInvalidationDoesNotOverflow() {
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.setTopDownOpt(true);
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+    RelOptCluster cluster = newCluster(planner);
+
+    List<RelSubset> subsets = new ArrayList<>();
+    CostLeafRel leaf = new CostLeafRel(cluster, "leaf", 1D);
+    RelSubset input = planner.ensureRegistered(leaf, null);
+    subsets.add(input);
+    CostSingleRel rel = null;
+    for (int i = 0; i < 4_999; i++) {
+      rel = new CostSingleRel(cluster, input, "rel" + i, 1D);
+      input = planner.ensureRegistered(rel, null);
+      subsets.add(input);
+    }
+    rel = new CostSingleRel(cluster, input, "rel4999", 1D);
+    planner.setRoot(rel);
+    subsets.add((RelSubset) planner.getRoot());
+    for (RelSubset subset : subsets) {
+      subset.startOptimize(planner.infCost);
+      subset.setOptimized();
+    }
+
+    leaf.cost = 2D;
+    cluster.getMetadataQuery().clearCache(leaf);
+    planner.propagateCostImprovements(leaf);
+
+    assertThat(((RelSubset) planner.getRoot()).bestCost.getRows(), is(5_002D));
+    for (RelSubset subset : subsets) {
+      assertNull(subset.taskState);
+    }
+  }
+
+  @Test void testDeepAcyclicPlanDoesNotOverflowCycleCheck() {
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+    RelOptCluster cluster = newCluster(planner);
+
+    RelSubset input =
+        planner.ensureRegistered(new CostLeafRel(cluster, "leaf", 1D), null);
+    CostSingleRel rel = null;
+    for (int i = 0; i < 4_999; i++) {
+      rel = new CostSingleRel(cluster, input, "rel" + i, 1D);
+      input = planner.ensureRegistered(rel, null);
+    }
+    rel = new CostSingleRel(cluster, input, "rel4999", 1D);
+    planner.setRoot(rel);
+    RelSubset rootSubset = (RelSubset) planner.getRoot();
+    RelNode candidate =
+        new CostSingleRel(cluster, rel.getInput(0), "candidate", 0.5D);
+
+    planner.ensureRegistered(candidate, rel);
+
+    assertThat(rootSubset.getBest(), instanceOf(CostSingleRel.class));
+    assertThat(((CostSingleRel) rootSubset.getBest()).label, is("candidate"));
+    assertTrue(planner.isValid(Litmus.THROW));
+  }
+
+  @Test void testReselectsAmongManyPlansWithSharedInput() {
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+    RelOptCluster cluster = newCluster(planner);
+
+    CostLeafRel directInput =
+        new CostLeafRel(cluster, "direct-input", 1D);
+    CostSingleRel initiallyBest =
+        new CostSingleRel(cluster, directInput, "initial", 1D);
+    planner.setRoot(initiallyBest);
+    RelSubset rootSubset = (RelSubset) planner.getRoot();
+
+    RelSubset sharedInput =
+        planner.ensureRegistered(
+            new CostLeafRel(cluster, "shared-input", 1D), null);
+    for (int i = 0; i < 999; i++) {
+      sharedInput =
+          planner.ensureRegistered(
+              new CostSingleRel(cluster, sharedInput, "shared" + i, 1D),
+              null);
+    }
+    for (int i = 0; i < 1_000; i++) {
+      planner.ensureRegistered(
+          new CostSingleRel(cluster, sharedInput, "alternative" + i,
+              2_000D - i),
+          initiallyBest);
+    }
+
+    directInput.cost = 10_000D;
+    cluster.getMetadataQuery().clearCache(directInput);
+    planner.propagateCostImprovements(directInput);
+
+    assertThat(rootSubset.getBest(), instanceOf(CostSingleRel.class));
+    assertThat(((CostSingleRel) rootSubset.getBest()).label,
+        is("alternative999"));
+    assertThat(rootSubset.bestCost.getRows(), is(2_001D));
+    assertTrue(planner.isValid(Litmus.THROW));
+  }
+
+  @Test void testPropagatesConvergingCostChangesOnce() {
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+    RelOptCluster cluster = newCluster(planner);
+
+    CostLeafRel input = new CostLeafRel(cluster, "input", 100D);
+    planner.ensureRegistered(input, null);
+    CostSingleRel relB = new CostSingleRel(cluster, input, "b", 1D);
+    planner.ensureRegistered(relB, null);
+    CostSingleRel relC = new CostSingleRel(cluster, relB, "c", 1D);
+    planner.ensureRegistered(relC, null);
+    CostSingleRel direct =
+        new CostSingleRel(cluster, input, "direct", 10D);
+    planner.setRoot(direct);
+    RelSubset rootSubset = (RelSubset) planner.getRoot();
+    CostSingleRel viaC = new CostSingleRel(cluster, relC, "via-c", 1D);
+    planner.ensureRegistered(viaC, direct);
+
+    assertThat(rootSubset.bestCost.getRows(), is(103D));
+    long timestamp = rootSubset.timestamp;
+
+    input.cost = 1D;
+    cluster.getMetadataQuery().clearCache(input);
+    planner.propagateCostImprovements(input);
+
+    assertThat(rootSubset.getBest(), instanceOf(CostSingleRel.class));
+    assertThat(((CostSingleRel) rootSubset.getBest()).label, is("via-c"));
+    assertThat(rootSubset.bestCost.getRows(), is(4D));
+    assertThat(rootSubset.timestamp, is(timestamp + 1));
+  }
+
+  @Test void testRenameRecomputesRemovedWinner() {
+    VolcanoPlanner planner = new VolcanoPlanner();
+    planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
+    RelOptCluster cluster = newCluster(planner);
+
+    CostLeafRel leafA = new CostLeafRel(cluster, "leaf-a", 1D);
+    CostSingleRel parentA =
+        new CostSingleRel(cluster, leafA, "parent", 10D);
+    planner.setRoot(parentA);
+    RelSubset rootSubset = (RelSubset) planner.getRoot();
+    RelNode registeredParentA = rootSubset.getBest();
+    assertNotNull(registeredParentA);
+
+    CostLeafRel leafB = new CostLeafRel(cluster, "leaf-b", 1D);
+    planner.ensureRegistered(leafB, null);
+    CostSingleRel parentB =
+        new CostSingleRel(cluster, leafB, "parent", 1D);
+    planner.ensureRegistered(parentB, parentA);
+    RelNode registeredParentB = rootSubset.getBest();
+    assertNotNull(registeredParentB);
+    assertNotSame(registeredParentA, registeredParentB);
+    assertThat(rootSubset.bestCost.getRows(), is(2D));
+
+    // Merging the inputs makes the parent expressions identical. The cheaper
+    // parent is removed by rename, so its subset winner must be recomputed.
+    planner.ensureRegistered(leafB, leafA);
+
+    rootSubset = (RelSubset) planner.getRoot();
+    assertThat(rootSubset.getBest(), sameInstance(registeredParentA));
+    assertThat(rootSubset.bestCost.getRows(), is(11D));
+    assertTrue(rootSubset.contains(registeredParentA));
+    assertTrue(planner.isValid(Litmus.THROW));
   }
 
   @Test void testPlanToDot() {
@@ -860,6 +1180,90 @@ class VolcanoPlannerTest {
       return new PhysToIteratorConverter(
           getCluster(),
           sole(inputs));
+    }
+  }
+
+  /** Leaf relational expression with a mutable cost. */
+  private static class CostLeafRel extends PlannerTests.TestLeafRel {
+    private double cost;
+    private final double rowCount;
+
+    CostLeafRel(RelOptCluster cluster, String label, double cost) {
+      this(cluster, label, cost, cost);
+    }
+
+    CostLeafRel(RelOptCluster cluster, String label, double cost,
+        double rowCount) {
+      super(cluster, cluster.traitSetOf(PHYS_CALLING_CONVENTION), label);
+      this.cost = cost;
+      this.rowCount = rowCount;
+    }
+
+    @Override public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
+      assert traitSet.comprises(PHYS_CALLING_CONVENTION);
+      assert inputs.isEmpty();
+      return this;
+    }
+
+    @Override public RelOptCost computeSelfCost(RelOptPlanner planner,
+        RelMetadataQuery mq) {
+      return planner.getCostFactory().makeCost(cost, cost, 0D);
+    }
+
+    @Override public double estimateRowCount(RelMetadataQuery mq) {
+      return rowCount;
+    }
+  }
+
+  /** Single-input relational expression with a fixed cost. */
+  private static class CostSingleRel extends TestSingleRel {
+    private final double cost;
+    private final String label;
+
+    CostSingleRel(RelOptCluster cluster, RelNode input, String label,
+        double cost) {
+      super(cluster, cluster.traitSetOf(PHYS_CALLING_CONVENTION), input);
+      this.label = label;
+      this.cost = cost;
+    }
+
+    @Override public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
+      assert traitSet.comprises(PHYS_CALLING_CONVENTION);
+      return new CostSingleRel(getCluster(), sole(inputs), label, cost);
+    }
+
+    @Override public RelOptCost computeSelfCost(RelOptPlanner planner,
+        RelMetadataQuery mq) {
+      return planner.getCostFactory().makeCost(cost, cost, 0D);
+    }
+
+    @Override public RelWriter explainTerms(RelWriter pw) {
+      return super.explainTerms(pw).item("label", label);
+    }
+  }
+
+  /** Single-input relational expression whose cost is its input row count. */
+  private static class RowCountCostSingleRel extends TestSingleRel {
+    private final String label;
+
+    RowCountCostSingleRel(RelOptCluster cluster, RelNode input, String label) {
+      super(cluster, cluster.traitSetOf(PHYS_CALLING_CONVENTION), input);
+      this.label = label;
+    }
+
+    @Override public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
+      assert traitSet.comprises(PHYS_CALLING_CONVENTION);
+      return new RowCountCostSingleRel(getCluster(), sole(inputs), label);
+    }
+
+    @Override public RelOptCost computeSelfCost(RelOptPlanner planner,
+        RelMetadataQuery mq) {
+      double rowCount = mq.getRowCount(getInput());
+      return planner.getCostFactory().makeCost(rowCount, rowCount, 0D);
+    }
+
+    @Override public RelWriter explainTerms(RelWriter pw) {
+      return super.explainTerms(pw).item("label", label);
     }
   }
 
